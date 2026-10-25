@@ -1,0 +1,92 @@
+name: iOS Duo AOT without LLVM
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.402'
+      - name: Select and verify Xcode 27.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_27.1.0.app/Contents/Developer
+          xcodebuild -version
+          test "$(xcrun --sdk iphoneos --show-sdk-version)" = '27.1'
+          dotnet workload install ios --version 10.0.402.1
+      - name: Prepare personal all-orientation test build
+        shell: python
+        run: |
+          import pathlib, plistlib
+          path = pathlib.Path('osu.iOS/Info.plist')
+          data = plistlib.loads(path.read_bytes())
+          directions = ['UIInterfaceOrientationPortrait', 'UIInterfaceOrientationPortraitUpsideDown', 'UIInterfaceOrientationLandscapeLeft', 'UIInterfaceOrientationLandscapeRight']
+          data['UISupportedInterfaceOrientations'] = directions
+          data['UISupportedInterfaceOrientations~ipad'] = directions
+          data['CFBundleIdentifier'] = 'com.kevzhi.osu.duo'
+          data['CFBundleDisplayName'] = 'osu! Duo Test'
+          path.write_bytes(plistlib.dumps(data, sort_keys=False))
+          path = pathlib.Path('osu.iOS/OsuGameIOS.cs')
+          source = path.read_text(encoding='utf-8-sig')
+          start = source.index('        private void updateOrientation()')
+          end = source.index('        protected override UpdateManager', start)
+          source = source[:start] + '''        // Personal test build: allow rotation on both displays, including during play.
+                  private void updateOrientation() => UIApplication.SharedApplication.InvokeOnMainThread(() =>
+                  {
+                      appDelegate.Orientations = UIInterfaceOrientationMask.All;
+                  });
+
+          ''' + source[end:]
+          path.write_text(source, encoding='utf-8')
+      - name: Build unsigned device app
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          git diff -- osu.iOS > artifacts/duo-source-changes.patch
+          (
+            while true; do
+              date -u '+%Y-%m-%dT%H:%M:%SZ'
+              ps -axo pid,ppid,%cpu,%mem,etime,comm | sort -k3 -nr | head -n 12 || true
+              sleep 60
+            done
+          ) >> artifacts/process-usage.log 2>&1 &
+          MONITOR_PID=$!
+          trap 'kill "$MONITOR_PID" 2>/dev/null || true' EXIT
+          dotnet publish osu.iOS/osu.iOS.csproj -c Release -r ios-arm64 -v:normal -p:UseInterpreter=false -p:MtouchInterpreter=-all -p:MtouchUseLlvm=false -p:NoDSymUtil=true -p:EnableCodeSigning=false -p:BuildIpa=false -p:ArchiveOnBuild=false -p:Version=0.1.0 -p:ApplicationVersion=0.1.0 2>&1 | tee artifacts/build.log
+      - name: Package unsigned IPA and record SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP='osu.iOS/bin/Release/net10.0-ios/ios-arm64/osu.iOS.app'
+          test -d "$APP"
+          /usr/libexec/PlistBuddy -c 'Print :DTSDKName' "$APP/Info.plist" | tee artifacts/sdk.txt
+          mkdir -p artifacts/Payload
+          ditto "$APP" artifacts/Payload/osu.iOS.app
+          cd artifacts
+          /usr/bin/zip -qry osu-duo-aot-unsigned.ipa Payload
+          printf '%s\n' 'Unsigned test build. Requires your Apple signing certificate and provisioning profile before installation. Inner/outer display rotation, touch mapping and layout still require device testing.' > README.txt
+      - name: Upload IPA and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: osu-duo-aot-unsigned
+          path: |
+            artifacts/*.ipa
+            artifacts/*.txt
+            artifacts/*.patch
+            artifacts/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
