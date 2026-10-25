@@ -1,0 +1,103 @@
+name: Sign existing iOS Duo IPA
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  sign:
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - name: Download successful unsigned build
+        uses: actions/download-artifact@v7
+        with:
+          name: osu-duo-fast-unsigned
+          run-id: 40201179022
+          github-token: ${{ github.token }}
+          path: unsigned
+      - name: Import signing materials into temporary keychain
+        env:
+          CERT_B64: ${{ secrets.IOS_DUO_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.IOS_DUO_P12_PASSWORD }}
+          PROFILE_B64: ${{ secrets.IOS_DUO_PROFILE_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$CERT_B64" && test -n "$CERT_PASSWORD" && test -n "$PROFILE_B64"
+          printf '%s' "$CERT_B64" | base64 --decode > "$RUNNER_TEMP/duo.p12"
+          printf '%s' "$PROFILE_B64" | base64 --decode > "$RUNNER_TEMP/duo.mobileprovision"
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 32)
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          KEYCHAIN="$RUNNER_TEMP/duo-signing.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/duo.p12" -P "$CERT_PASSWORD" -t cert -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN"
+      - name: Validate profile and sign existing app
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p signing signed
+          ditto -x -k unsigned/osu-duo-fast-unsigned.ipa signing
+          security cms -D -i "$RUNNER_TEMP/duo.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          python3 - <<'PY'
+          import datetime, hashlib, os, pathlib, plistlib, shutil, subprocess
+          temp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          app = pathlib.Path('signing/Payload/osu.iOS.app')
+          profile = plistlib.loads((temp / 'profile.plist').read_bytes())
+          info = plistlib.loads((app / 'Info.plist').read_bytes())
+          assert info['CFBundleIdentifier'] == 'com.kevzhi.osu.duo'
+          assert profile['ExpirationDate'] > datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+          entitlements = profile['Entitlements']
+          assert entitlements['application-identifier'].endswith('.' + info['CFBundleIdentifier'])
+          assert entitlements.get('get-task-allow', False) is False
+          assert len(profile.get('ProvisionedDevices', [])) == 1
+          assert not list(app.rglob('*.appex')), 'Extensions need individual profiles'
+          keychain = str(temp / 'duo-signing.keychain-db')
+          identities = subprocess.check_output(['security', 'find-identity', '-v', '-p', 'codesigning', keychain], text=True)
+          candidates = [hashlib.sha1(c).hexdigest().upper() for c in profile['DeveloperCertificates']]
+          matches = [c for c in candidates if c in identities]
+          assert len(matches) == 1, 'Certificate does not match profile'
+          identity = matches[0]
+          shutil.copyfile(temp / 'duo.mobileprovision', app / 'embedded.mobileprovision')
+          entitlements_path = temp / 'entitlements.plist'
+          entitlements_path.write_bytes(plistlib.dumps(entitlements))
+          def sign(path, entitlements=False):
+              args = ['codesign', '--force', '--sign', identity, '--keychain', keychain, '--timestamp=none']
+              if entitlements:
+                  args += ['--entitlements', str(entitlements_path), '--generate-entitlement-der']
+              subprocess.run(args + [str(path)], check=True)
+          main_binary = app / info['CFBundleExecutable']
+          magic = {bytes.fromhex(h) for h in ['feedface', 'feedfacf', 'cefaedfe', 'cffaedfe', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca']}
+          for path in app.rglob('*'):
+              if not path.is_file() or path == main_binary or any(p.suffix == '.framework' for p in path.parents):
+                  continue
+              with path.open('rb') as f:
+                  is_macho = f.read(4) in magic
+              if is_macho:
+                  sign(path)
+          for framework in sorted(app.rglob('*.framework'), key=lambda p: len(p.parts), reverse=True):
+              sign(framework)
+          sign(app, entitlements=True)
+          subprocess.run(['codesign', '--verify', '--deep', '--strict', '--verbose=2', str(app)], check=True)
+          print('Bundle, profile, signing identity and nested signatures verified.')
+          PY
+          cd signing
+          /usr/bin/zip -qry ../signed/osu-duo-fast-signed.ipa Payload
+      - name: Upload signed IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: osu-duo-fast-signed
+          path: signed/osu-duo-fast-signed.ipa
+          retention-days: 1
+          if-no-files-found: error
+      - name: Clean temporary credentials
+        if: always()
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/duo-signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/duo.p12" "$RUNNER_TEMP/duo.mobileprovision" "$RUNNER_TEMP/profile.plist" "$RUNNER_TEMP/entitlements.plist"
