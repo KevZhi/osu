@@ -55,7 +55,7 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts
           git diff -- osu.iOS > artifacts/duo-source-changes.patch
-          dotnet publish osu.iOS/osu.iOS.csproj -c Release -r ios-arm64 -p:TrimMode=copy -p:UseInterpreter=true -p:MtouchInterpreter=all -p:MtouchUseLlvm=false -p:NoDSymUtil=true -p:NoSymbolStrip=true -p:EnableCodeSigning=false -p:BuildIpa=false -p:ArchiveOnBuild=false -p:Version=0.1.0 -p:ApplicationVersion=0.1.0 2>&1 | tee artifacts/build.log
+          dotnet publish osu.iOS/osu.iOS.csproj -c Release -r ios-arm64 -p:UseInterpreter=true -p:MtouchInterpreter=all -p:MtouchUseLlvm=false -p:NoDSymUtil=true -p:NoSymbolStrip=true -p:EnableCodeSigning=false -p:BuildIpa=false -p:ArchiveOnBuild=false -p:Version=0.1.0 -p:ApplicationVersion=0.1.0 2>&1 | tee artifacts/build.log
       - name: Package unsigned IPA and record SDK
         shell: bash
         run: |
