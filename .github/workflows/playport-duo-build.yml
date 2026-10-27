@@ -1,0 +1,124 @@
+name: Build Playport for Duo with iOS 27.1
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: playport-duo-build
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 180
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: playportdev/playport
+          ref: 412de5f8c0bdd26d84e0127eb5776ba992e3b152
+          persist-credentials: false
+      - name: Verify real SDK and install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(xcrun --sdk iphoneos --show-sdk-version)" = 27.1
+          xcodebuild -version
+          brew install bash llvm lld coreutils gnu-sed gnu-tar findutils grep bison flex gettext autoconf automake libtool pkgconf meson ninja cmake p7zip util-linux
+          python3 -m venv .work/python
+          .work/python/bin/pip install pefile packaging mako pyyaml
+          for tool in coreutils gnu-sed gnu-tar findutils grep; do echo "$(brew --prefix "$tool")/libexec/gnubin" >> "$GITHUB_PATH"; done
+          for tool in bash llvm lld bison flex gettext util-linux; do echo "$(brew --prefix "$tool")/bin" >> "$GITHUB_PATH"; done
+          echo "$GITHUB_WORKSPACE/.work/python/bin" >> "$GITHUB_PATH"
+      - name: Prepare ARM64EC compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .work/inputs
+          curl -fL --retry 3 https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-macos-universal.tar.xz -o .work/inputs/mingw.tar.xz
+          tar -xf .work/inputs/mingw.tar.xz -C .work/inputs
+          export LLVM_MINGW="$PWD/.work/inputs/llvm-mingw-20260922-ucrt-macos-universal"
+          test -x "$LLVM_MINGW/bin/aarch64-w64-mingw32-clang"
+          echo "LLVM_MINGW=$LLVM_MINGW" >> "$GITHUB_ENV"
+          git clone --filter=blob:none https://github.com/mingw-w64/mingw-w64.git .work/inputs/mingw-src
+          git -C .work/inputs/mingw-src checkout 57b595039040eaa15bece85b7cc71d952281b269
+          mkdir -p .work/inputs/crt-build
+          (cd .work/inputs/crt-build && PATH="$LLVM_MINGW/bin:$PATH" ../mingw-src/mingw-w64-crt/configure --prefix="$LLVM_MINGW" --host=aarch64-w64-mingw32 --disable-lib32 --disable-lib64 --enable-libarm64 --enable-arm64x --with-default-msvcrt=ucrt --enable-cfguard --enable-silent-rules && make -j3 && make install)
+          builtin=$(find "$LLVM_MINGW" -name libclang_rt.builtins-aarch64.a -print -quit)
+          test -n "$builtin"
+          for name in libgcc.a libgcc_eh.a libgcc_s.a; do cp "$builtin" "$LLVM_MINGW/aarch64-w64-mingw32/lib/$name"; done
+      - name: Adapt build scripts to native macOS and SDK 27.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DARWIN_SDK="$(dirname "$DEVELOPER_DIR")"
+          echo "DARWIN_SDK=$DARWIN_SDK" >> "$GITHUB_ENV"
+          echo "LD64=$(xcrun --find ld)" >> "$GITHUB_ENV"
+          export PP_LLVM="$(brew --prefix llvm)/bin"
+          python3 - <<'PY'
+          import pathlib, os, plistlib
+          root=pathlib.Path('.')
+          env=root/'build/env.sh'
+          s=env.read_text().replace('iPhoneOS26.5.sdk','iPhoneOS27.1.sdk').replace('MacOSX26.5.sdk','MacOSX27.0.sdk')
+          env.write_text(s)
+          for p in (root/'build').rglob('*.sh'):
+              s=p.read_text()
+              for tool in ('clang++','clang','llvm-ar','llvm-ranlib','llvm-nm','llvm-strip','llvm-lipo','llvm-libtool-darwin'):
+                  s=s.replace('/usr/bin/'+tool,os.environ['PP_LLVM']+'/'+tool)
+              p.write_text(s)
+          p=root/'build/pipeline'; s=p.read_text()
+          start=s.index('    # The Swift frontend needs the host')
+          end=s.index('    grep -q INCREASED_MEMORY_LIMIT',start)
+          s=s[:start]+s[end:]
+          s=s.replace('SWIFTPM_CUSTOM_BIN_DIR=$HERE/ld64 ', '').replace('Playport-26.5-', 'Playport-27.1-')
+          p.write_text(s)
+          p=root/'app/Info.plist'
+          d=plistlib.loads(p.read_bytes())
+          d['UISupportedInterfaceOrientations']=['UIInterfaceOrientationLandscapeLeft','UIInterfaceOrientationLandscapeRight']
+          d['UISupportedInterfaceOrientations~ipad']=d['UISupportedInterfaceOrientations']
+          d['UILaunchScreen']={}
+          d['CFBundleDisplayName']='Playport Duo'
+          p.write_bytes(plistlib.dumps(d))
+          PY
+          mkdir -p .work/inputs/rust/cargo/bin
+          rustup toolchain install 1.99.0 --profile minimal --target aarch64-apple-ios
+          for cmd in rustc cargo rustup; do ln -sf "$(command -v "$cmd")" ".work/inputs/rust/cargo/bin/$cmd"; done
+          ln -s "$HOME/.rustup" .work/inputs/rust/rustup
+          echo RUSTUP_TOOLCHAIN=1.99.0 >> "$GITHUB_ENV"
+          git diff --check
+          git diff > .work/duo-sdk27.1.patch
+      - name: Compile Playport and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          export JOBS=3
+          bash build/pipeline --variant release --unsigned
+      - name: Collect bounded diagnostic logs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p .work/diagnostics
+          python3 - <<'PY'
+          import pathlib
+          root=pathlib.Path('.work')
+          out=root/'diagnostics'
+          for p in root.rglob('*.log'):
+              if out in p.parents: continue
+              if p.is_file():
+                  name=str(p.relative_to(root)).replace('/','__')
+                  (out/name).write_bytes(p.read_bytes()[-100000:])
+          PY
+          cp .work/duo-sdk27.1.patch .work/diagnostics/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playport-duo-build-diagnostics
+          path: .work/diagnostics
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: playport-duo-27.1-unsigned
+          path: .work/out/**/*.ipa
+          if-no-files-found: error
+          retention-days: 1
