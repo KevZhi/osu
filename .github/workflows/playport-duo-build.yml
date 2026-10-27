@@ -39,6 +39,7 @@ jobs:
           curl -fL --retry 3 https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-macos-universal.tar.xz -o .work/inputs/mingw.tar.xz
           tar -xf .work/inputs/mingw.tar.xz -C .work/inputs
           export LLVM_MINGW="$PWD/.work/inputs/llvm-mingw-20260922-ucrt-macos-universal"
+          export PATH="$LLVM_MINGW/bin:$PATH"
           test -x "$LLVM_MINGW/bin/aarch64-w64-mingw32-clang"
           echo "LLVM_MINGW=$LLVM_MINGW" >> "$GITHUB_ENV"
           git clone --filter=blob:none https://github.com/mingw-w64/mingw-w64.git .work/inputs/mingw-src
