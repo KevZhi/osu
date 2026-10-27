@@ -1,0 +1,23 @@
+name: Playport iOS 27.1 build environment
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: xcode-27
+    timeout-minutes: 10
+    steps:
+      - name: Inspect installed SDKs and build tools
+        shell: bash
+        run: |
+          set -eu
+          uname -a
+          xcodebuild -version
+          xcodebuild -showsdks
+          ls /Applications | grep Xcode
+          xcrun --sdk iphoneos --show-sdk-path
+          swift --version
+          command -v docker || true
+          command -v clang || true
+          df -h .
