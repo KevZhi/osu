@@ -19,6 +19,11 @@ jobs:
           repository: playportdev/playport
           ref: 412de5f8c0bdd26d84e0127eb5776ba992e3b152
           persist-credentials: false
+      - uses: actions/cache/restore@v4
+        with:
+          path: .work/inputs
+          key: playport-macos27.1-tools-v1-${{ github.run_id }}
+          restore-keys: playport-macos27.1-tools-v1-
       - name: Verify real SDK and install build tools
         shell: bash
         run: |
@@ -36,19 +41,21 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .work/inputs
-          curl -fL --retry 3 https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-macos-universal.tar.xz -o .work/inputs/mingw.tar.xz
-          tar -xf .work/inputs/mingw.tar.xz -C .work/inputs
           export LLVM_MINGW="$PWD/.work/inputs/llvm-mingw-20260922-ucrt-macos-universal"
           export PATH="$LLVM_MINGW/bin:$PATH"
-          test -x "$LLVM_MINGW/bin/aarch64-w64-mingw32-clang"
           echo "LLVM_MINGW=$LLVM_MINGW" >> "$GITHUB_ENV"
-          git clone --filter=blob:none https://github.com/mingw-w64/mingw-w64.git .work/inputs/mingw-src
+          if test -f "$LLVM_MINGW/.playport-crt-ready"; then exit 0; fi
+          curl -fL --retry 3 https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-macos-universal.tar.xz -o .work/inputs/mingw.tar.xz
+          tar -xf .work/inputs/mingw.tar.xz -C .work/inputs
+          test -x "$LLVM_MINGW/bin/aarch64-w64-mingw32-clang"
+          test -d .work/inputs/mingw-src/.git || git clone --filter=blob:none https://github.com/mingw-w64/mingw-w64.git .work/inputs/mingw-src
           git -C .work/inputs/mingw-src checkout 57b595039040eaa15bece85b7cc71d952281b269
           mkdir -p .work/inputs/crt-build
           (cd .work/inputs/crt-build && PATH="$LLVM_MINGW/bin:$PATH" ../mingw-src/mingw-w64-crt/configure --prefix="$LLVM_MINGW" --host=aarch64-w64-mingw32 --disable-lib32 --disable-lib64 --enable-libarm64 --enable-arm64x --with-default-msvcrt=ucrt --enable-cfguard --enable-silent-rules && make -j3 && make install)
           builtin=$(find "$LLVM_MINGW" -name libclang_rt.builtins-aarch64.a -print -quit)
           test -n "$builtin"
           for name in libgcc.a libgcc_eh.a libgcc_s.a; do cp "$builtin" "$LLVM_MINGW/aarch64-w64-mingw32/lib/$name"; done
+          touch "$LLVM_MINGW/.playport-crt-ready"
       - name: Adapt build scripts to native macOS and SDK 27.1
         shell: bash
         run: |
@@ -56,6 +63,7 @@ jobs:
           export DARWIN_SDK="$(dirname "$DEVELOPER_DIR")"
           echo "DARWIN_SDK=$DARWIN_SDK" >> "$GITHUB_ENV"
           echo "LD64=$(xcrun --find ld)" >> "$GITHUB_ENV"
+          echo "LIBTOOL=$(xcrun --find libtool)" >> "$GITHUB_ENV"
           export PP_LLVM="$(brew --prefix llvm)/bin"
           python3 - <<'PY'
           import pathlib, os, plistlib
@@ -63,6 +71,11 @@ jobs:
           env=root/'build/env.sh'
           s=env.read_text().replace('iPhoneOS26.5.sdk','iPhoneOS27.1.sdk').replace('MacOSX26.5.sdk','MacOSX27.0.sdk')
           env.write_text(s)
+          p=root/'build/stages/unix.sh'
+          s=p.read_text()
+          old='*) echo / ;;'
+          assert old in s, 'Expected Linux host SDK shim not found'
+          p.write_text(s.replace(old, '*) echo "$MACSDK" ;;'))
           for p in (root/'build').rglob('*.sh'):
               s=p.read_text()
               for tool in ('clang++','clang','llvm-ar','llvm-ranlib','llvm-nm','llvm-strip','llvm-lipo','llvm-libtool-darwin'):
@@ -72,7 +85,13 @@ jobs:
           start=s.index('    # The Swift frontend needs the host')
           end=s.index('    grep -q INCREASED_MEMORY_LIMIT',start)
           s=s[:start]+s[end:]
-          s=s.replace('SWIFTPM_CUSTOM_BIN_DIR=$HERE/ld64 ', '').replace('Playport-26.5-', 'Playport-27.1-')
+          s=s.replace('Playport-26.5-', 'Playport-27.1-')
+          p.write_text(s)
+          p=root/'build/ld64/swift-build'
+          s=p.read_text()
+          start=s.index('case "$trampoline" in')
+          end=s.index('\nesac',start)+len('\nesac')
+          s=s[:start]+'trampoline="$(xcrun --find ld)"'+s[end:]
           p.write_text(s)
           p=root/'app/Info.plist'
           d=plistlib.loads(p.read_bytes())
@@ -85,7 +104,7 @@ jobs:
           mkdir -p .work/inputs/rust/cargo/bin
           rustup toolchain install 1.99.0 --profile minimal --target aarch64-apple-ios
           for cmd in rustc cargo rustup; do ln -sf "$(command -v "$cmd")" ".work/inputs/rust/cargo/bin/$cmd"; done
-          ln -s "$HOME/.rustup" .work/inputs/rust/rustup
+          test -L .work/inputs/rust/rustup || ln -s "$HOME/.rustup" .work/inputs/rust/rustup
           echo RUSTUP_TOOLCHAIN=1.99.0 >> "$GITHUB_ENV"
           git diff --check
           git diff > .work/duo-sdk27.1.patch
@@ -117,6 +136,11 @@ jobs:
           name: playport-duo-build-diagnostics
           path: .work/diagnostics
           retention-days: 1
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .work/inputs
+          key: playport-macos27.1-tools-v1-${{ github.run_id }}
       - uses: actions/upload-artifact@v4
         with:
           name: playport-duo-27.1-unsigned
