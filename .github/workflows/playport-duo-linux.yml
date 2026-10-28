@@ -1,0 +1,179 @@
+name: Playport Linux build with iOS 27.1
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: playport-linux-sdk27
+  cancel-in-progress: false
+jobs:
+  sdk:
+    name: Export SDK for Linux
+    runs-on: xcode-27
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: playportdev/playport
+          ref: 412de5f8c0bdd26d84e0127eb5776ba992e3b152
+          persist-credentials: false
+      - name: Export genuine SDK using xtool
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(xcrun --sdk iphoneos --show-sdk-version)" = 27.1
+          brew install openssl@3
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+          bash build/toolchain/xtool.sh
+          .work/inputs/xtool-src/.build/release/xtool sdk build /Applications/Xcode_27.1.app .work/sdk --arch x86_64
+          test -d .work/sdk/darwin.xtoolsdk/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS27.1.sdk
+      - name: Encrypt temporary SDK transfer
+        shell: bash
+        env:
+          SDK_TRANSFER_PASSWORD: ${{ secrets.UTM_DEV_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$SDK_TRANSFER_PASSWORD"
+          tar -czf - -C .work/sdk darwin.xtoolsdk | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass env:SDK_TRANSFER_PASSWORD -out .work/sdk27.tar.gz.enc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdk27-encrypted
+          path: .work/sdk27.tar.gz.enc
+          retention-days: 1
+          compression-level: 0
+  build:
+    name: Linux x86_64 compile
+    needs: sdk
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    container: swift:6.4.0-noble
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      JOBS: '3'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: playportdev/playport
+          ref: 412de5f8c0bdd26d84e0127eb5776ba992e3b152
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdk27-encrypted
+          path: .work/transfer
+      - name: Install Linux prerequisites and LLVM 22
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y ca-certificates curl wget gnupg build-essential bison flex gettext cmake ninja-build meson python3 python3-venv xxd openssl patch git rsync p7zip-full autoconf automake libtool pkg-config zstd libssl-dev libxml2-dev liblzma-dev libz-dev libedit-dev libcurl4-openssl-dev
+          mkdir -p /etc/apt/keyrings
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /etc/apt/keyrings/llvm.gpg
+          echo 'deb [signed-by=/etc/apt/keyrings/llvm.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main' > /etc/apt/sources.list.d/llvm22.list
+          apt-get update
+          apt-get install -y clang-22 lld-22 llvm-22 llvm-22-dev llvm-22-tools
+          for bin in /usr/lib/llvm-22/bin/*; do
+            name=$(basename "$bin")
+            case "$name" in clang|clang++|ld64.lld|lld|lld-link|llvm-*) ln -sf "$bin" "/usr/bin/$name";; esac
+          done
+          echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
+          python3 -m venv .work/python
+          .work/python/bin/pip install pefile packaging mako pyyaml meson
+          echo "$GITHUB_WORKSPACE/.work/python/bin" >> "$GITHUB_PATH"
+          mkdir -p /usr/lib/swift/lib
+          ln -sfn /usr/share/swift/usr/lib/clang /usr/lib/swift/lib/clang
+          swift --version
+          /usr/bin/clang --version
+          df -h .
+      - name: Install SDK without publishing its contents
+        shell: bash
+        env:
+          SDK_TRANSFER_PASSWORD: ${{ secrets.UTM_DEV_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p .work/sdk
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:SDK_TRANSFER_PASSWORD -in .work/transfer/sdk27.tar.gz.enc | tar -xz -C .work/sdk
+          mv .work/sdk/darwin.xtoolsdk .work/sdk/darwin.artifactbundle
+          mkdir -p "$HOME/.swiftpm/swift-sdks"
+          ln -s "$GITHUB_WORKSPACE/.work/sdk/darwin.artifactbundle" "$HOME/.swiftpm/swift-sdks/darwin.artifactbundle"
+          echo "DARWIN_SDK=$GITHUB_WORKSPACE/.work/sdk/darwin.artifactbundle" >> "$GITHUB_ENV"
+          swift sdk list
+      - uses: actions/cache/restore@v4
+        with:
+          path: .work/inputs
+          key: playport-linux-tools-22-v1-${{ github.run_id }}
+          restore-keys: playport-linux-tools-22-v1-
+      - name: Prepare pinned ARM64EC toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .work/inputs
+          export LLVM_MINGW="$GITHUB_WORKSPACE/.work/inputs/llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64"
+          echo "LLVM_MINGW=$LLVM_MINGW" >> "$GITHUB_ENV"
+          if test -f "$LLVM_MINGW/.playport-crt-ready"; then exit 0; fi
+          curl -fL --retry 3 https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llvm-mingw-20260922-ucrt-ubuntu-22.04-x86_64.tar.xz -o .work/inputs/mingw.tar.xz
+          echo 'bb7bb7654b33d5aa8712acb837c963b2e0c56352560c76105270a3268c665c21  .work/inputs/mingw.tar.xz' | sha256sum -c -
+          tar -xf .work/inputs/mingw.tar.xz -C .work/inputs
+          export PATH="$LLVM_MINGW/bin:$PATH"
+          test -d .work/inputs/mingw-src/.git || git clone --filter=blob:none https://github.com/mingw-w64/mingw-w64.git .work/inputs/mingw-src
+          git -C .work/inputs/mingw-src checkout 57b595039040eaa15bece85b7cc71d952281b269
+          mkdir -p .work/inputs/crt-build
+          (cd .work/inputs/crt-build && ../mingw-src/mingw-w64-crt/configure --prefix="$LLVM_MINGW" --host=aarch64-w64-mingw32 --disable-lib32 --disable-lib64 --enable-libarm64 --enable-arm64x --with-default-msvcrt=ucrt --enable-cfguard --enable-silent-rules && make -j3 && make install)
+          builtin=$(find "$LLVM_MINGW" -name libclang_rt.builtins-aarch64.a -print -quit)
+          test -n "$builtin"
+          for name in libgcc.a libgcc_eh.a libgcc_s.a; do cp "$builtin" "$LLVM_MINGW/aarch64-w64-mingw32/lib/$name"; done
+          touch "$LLVM_MINGW/.playport-crt-ready"
+      - name: Apply only SDK and launch configuration changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, plistlib
+          p=pathlib.Path('build/env.sh')
+          p.write_text(p.read_text().replace('iPhoneOS26.5.sdk','iPhoneOS27.1.sdk').replace('MacOSX26.5.sdk','MacOSX27.0.sdk'))
+          p=pathlib.Path('app/Info.plist')
+          d=plistlib.loads(p.read_bytes())
+          d['UILaunchScreen']={}
+          d['CFBundleDisplayName']='Playport Duo'
+          d['UISupportedInterfaceOrientations']=['UIInterfaceOrientationLandscapeLeft','UIInterfaceOrientationLandscapeRight']
+          d['UISupportedInterfaceOrientations~ipad']=d['UISupportedInterfaceOrientations']
+          p.write_bytes(plistlib.dumps(d))
+          PY
+          git diff --check
+          git diff > .work/duo-sdk27.1.patch
+      - name: Compile with original Linux pipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash build/pipeline --variant release --unsigned
+      - name: Collect diagnostics
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p .work/diagnostics
+          python3 - <<'PY'
+          import pathlib
+          root=pathlib.Path('.work'); out=root/'diagnostics'
+          for p in root.rglob('*.log'):
+              if any(x in p.parts for x in ('sdk','transfer','diagnostics')): continue
+              if p.is_file(): (out/str(p.relative_to(root)).replace('/','__')).write_bytes(p.read_bytes()[-100000:])
+          PY
+          cp .work/duo-sdk27.1.patch .work/diagnostics/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playport-linux-diagnostics
+          path: .work/diagnostics
+          retention-days: 1
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .work/inputs
+          key: playport-linux-tools-22-v1-${{ github.run_id }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: playport-duo-27.1-unsigned
+          path: .work/out/**/*.ipa
+          if-no-files-found: error
+          retention-days: 1
