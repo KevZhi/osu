@@ -1,14 +1,21 @@
 name: Playport Linux build with iOS 27.1
 on:
   workflow_dispatch:
+    inputs:
+      sdk_run:
+        description: Existing run containing sdk27-encrypted; leave empty to export again
+        type: string
+        default: '40632395757'
 permissions:
   contents: read
+  actions: read
 concurrency:
   group: playport-linux-sdk27
   cancel-in-progress: false
 jobs:
   sdk:
     name: Export SDK for Linux
+    if: inputs.sdk_run == ''
     runs-on: xcode-27
     timeout-minutes: 30
     env:
@@ -46,6 +53,7 @@ jobs:
   build:
     name: Linux x86_64 compile
     needs: sdk
+    if: always() && (needs.sdk.result == 'success' || needs.sdk.result == 'skipped')
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     container: swift:6.4.0-noble
@@ -53,14 +61,30 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
       JOBS: '3'
     steps:
+      - name: Install Git before checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y git ca-certificates
+          git --version
       - uses: actions/checkout@v4
         with:
           repository: playportdev/playport
           ref: 412de5f8c0bdd26d84e0127eb5776ba992e3b152
           persist-credentials: false
+      - name: Verify full Git checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d .git
+          test "$(git rev-parse HEAD)" = 412de5f8c0bdd26d84e0127eb5776ba992e3b152
+          git submodule status
       - uses: actions/download-artifact@v4
         with:
           name: sdk27-encrypted
+          run-id: ${{ inputs.sdk_run || github.run_id }}
+          github-token: ${{ github.token }}
           path: .work/transfer
       - name: Install Linux prerequisites and LLVM 22
         shell: bash
