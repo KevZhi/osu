@@ -78,6 +78,7 @@ jobs:
           p.write_text(s.replace(old, '*) echo "$MACSDK" ;;'))
           for p in (root/'build').rglob('*.sh'):
               s=p.read_text()
+              s=s.replace('--without-mingw', '--with-mingw="$LLVM_MINGW/bin/clang"')
               for tool in ('clang++','clang','llvm-ar','llvm-ranlib','llvm-nm','llvm-strip','llvm-lipo','llvm-libtool-darwin'):
                   s=s.replace('/usr/bin/'+tool,os.environ['PP_LLVM']+'/'+tool)
               p.write_text(s)
