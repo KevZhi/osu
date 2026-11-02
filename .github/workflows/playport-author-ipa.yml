@@ -58,7 +58,7 @@ jobs:
             git config --global --add safe.directory /w/playport
             python3 build/docker/sdk-tbd.py /w/sdk
             bash build/docker/llvm-mingw.sh /w/llvm-mingw
-            ./pp setup --llvm-mingw /w/llvm-mingw --darwin-sdk /w/sdk
+            ./pp setup --llvm-mingw /w/llvm-mingw --darwin-sdk /w/sdk --usbmux-socket /tmp/playport-ci-usbmux.sock
             printf "#!/bin/sh\n# INCREASED_MEMORY_LIMIT\nexit 1\n" > /w/xtool-stub
             chmod +x /w/xtool-stub
             XTOOL=/w/xtool-stub ./pp build --to notices
