@@ -1,0 +1,18 @@
+name: Playport Duo author toolchain
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/duo-author-check.yml']
+permissions:
+  contents: read
+jobs:
+  container:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: De-Os/playport
+          ref: iphone-duo
+          persist-credentials: false
+      - name: Build the author's Linux ARM64 toolchain
+        run: docker build --platform linux/arm64 -t playport-build build/docker
