@@ -16,8 +16,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: Playport-Duo-unsigned
-          repository: KevZhi/playport
+          name: playport-duo-27.1-unsigned
           path: unsigned
           run-id: ${{ inputs.build_run }}
           github-token: ${{ github.token }}
